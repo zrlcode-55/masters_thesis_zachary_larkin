@@ -1,0 +1,30 @@
+# Core scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Configuration management
+pyyaml>=6.0
+dataclasses-json>=0.6.0
+
+# Statistics and change detection
+statsmodels>=0.14.0
+
+# Progress tracking
+tqdm>=4.65.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Type checking (optional)
+mypy>=1.4.0
+
+# ns-3 Python bindings (requires ns-3 installation)
+# Note: ns-3 must be built with Python bindings enabled
+# See: https://www.nsnam.org/docs/release/3.38/tutorial/html/getting-started.html
+

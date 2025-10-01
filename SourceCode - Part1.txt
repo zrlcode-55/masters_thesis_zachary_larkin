@@ -1,0 +1,477 @@
+# -*- coding: utf-8 -*-
+"""
+Spyder Editor
+Last edited in IDE 09/02/2025
+
+Vanderbilt Master's Thesis - Zachary Larkin 
+"""
+
+
+# Initial Source Code - Guiding light going into the intial experimental design
+# Factored for pure LPWAN deployment
+
+
+# The novel contributions are IN IoU acceptance/continuous stability tracking/radio-realistic bounds/adaptive robustness 
+# specifically target intra network consensus challenges
+
+
+
+# =========================================================
+# T0  Scenario inputs (every var documented  defaults shown)
+# =========================================================
+INPUT:
+  N - (int) number of container sensors I have (100 example)
+    -  Larger N increases message will help diversity but also collision risk.
+
+  Area  -(meters x meters) yard size (1000m x 1000m).
+ -  Used by ns-3 to place nodes results pathloss,SF assignment, collisions.
+
+  Beta - (float in[0,1]) Byzantine fraction,ex 0.1= 10 % of nodes adversarial
+
+  Epsilon - (float) ε-agreement tolerance on the final estimate (e.g., 1.0 C).
+ -  Both pairwise agreement and closeness to truth must be ≤ ε. end result
+
+  W0 -  (float)initial CI half-width per node (ex 5.0 C) -- I want each to be pretty uncertain off the start
+ -  Encodes initial uncertainty and drives the log term in the bound log(W0/ε).
+
+  NoiseSigma-(float)honest sensor noise std-dev (example 0.5 C) -- I dont want to over-engineer this
+
+
+
+
+
+   ---- Radio & LPWAN knobs (LoRa class) --- network init in env
+  SF    # (int) spreading factor ∈ {7..12}  higher = longer airtime-->  better range - I have to be careful with this
+  BW     # (kHz)channel bandwidth (ex 125)
+  CR     # (coding rate) LoRa coding rate(4/5).
+  TxPower  # (dBm) transmit power(14).
+  DutyCycle  # (fraction) per-node airtime cap, e.g., 0.01 = 1% (regulatory).
+  ALOHA       # (enum) "pure" → uncoordinated MAC collisions handled at PHY. Shouting nodes and I hope it gets through
+  WakeFraction   # (fraction) awake time per node (async schedules), example--> 0.5.
+
+
+
+
+
+  --- Robustness + acceptance knobs ---- Intersection over union contibution 
+  AcceptTau_IOU   # (float in [0,1])intersection-over-union threshold for CI acceptance (scale-invariant).
+                #  Typical 0.15 0.25 - higher --> stricter - combats mimics adversary CI 
+                # Container will only trust each other if CI overlaps enough
+
+
+  TrimT_min    # (int) min trim per side when removing extremes (>= expected local f).
+  TrimT_max     # (int) max trim per side to avoid discarding too much(  20% of neighbors).
+                # decent protection from skewing the averages 
+
+
+  Estimator     # (enum){TrimmedMean | GeomMedian | MoM | Catoni}  - Combining my accepted vlaues 
+                 #  - TrimmedMean fast  GeomMedian/Median-of-Means resist mimicry  Catoni handles heavy tails.
+
+
+
+  --- Contraction & adaptivity amungst neighbors ---- fine line between riskings terrible reads and consensus taking forever
+  LambdaMin    # (float)minimum per/round contraction 0<λ≤1 (0.05).
+  LambdaMax   # (float) maximum per/round contraction (0.20).
+             #  Adaptive - λ maps dispersion --> λ ∈ [LambdaMin,LambdaMax].
+
+
+
+
+  # ----- Continuous ops & cont health ----
+  ChangeDetect   # (enum) {CUSUM / GLR / OFF} – detect truth changes (door open) --> measure re-stabilization 
+  K_quarantine - my probation period    # (int) rounds a new/joining node is throttled (3–5) to avoid instant bias on entry.
+  PartitionTimeout_s  # (seconds) stale RX threshold to declare network partition and track per-component ε-agreement.
+
+
+  # --- Experimental control and stops - open to chmage here
+  RoundBudget_s  # (seconds) target ' effective round' wall-time ≈ T_pkt / DutyCycle(ns-3 ref).
+  Seeds          # (list) RNG seeds for multi-run confidence (20 runs).
+  MaxRounds      # (int) hard cap on rounds to avoid infinite loops(5000).
+
+
+
+
+
+
+# =========================================================
+# 1. ns3 topology & radio setup (packet-accurate ground truth) - lot digital twin
+#    I wish that I had more here but I am really working hard on envisioning this
+# =========================================================
+PROC SetupNetwork():
+  # NS3 Create nodes & place in yard  placement impacts SNR ---> SF & capture
+  nodes=NS3.CreateNodes(N) # tmp sensor,Lora Radio and program to send / receive
+  NS3.PlaceNodes(nodes,Area, placement="grid-with-jitter") # setting bounds for the clutter i need
+
+  # NS3 Configure LoRa PHY/MAC collisions from time/freq overlap & SF capture 
+  NS3.ConfigureLoRa(
+      nodes=nodes, SF=SF, BW=BW, CR=CR, TxPower=TxPower,
+      classA_windows=True,aloha_mode=ALOHA)
+
+
+
+  # [NS3] Enforce regulatory airtime and async sleep + wake schedules
+  NS3.ConfigureDutyCycle(nodes,duty_cycle=DutyCycle)
+  NS3.ConfigureWakeSchedules(nodes, wake_fraction=WakeFraction, unsynchronized=True)
+
+  RETURN nodes
+# ns3 notes:
+# - Use PHY traces (PhyTxBegin,PhyRxEndOk,PhyRxDrop) to compute p_s and airtime T_pkt
+# - Use module airtime calculators (or LoRa formula) to verify T_pkt = f(SF,BW,CR,payload)
+# - MAC traces show duty-cycle blocking & receive windows misses ---> realism for p_s
+# Like I said, more to come here, I am open to suggestions --> this is not a toy channel I want to leverage real collision,
+# duty cycle  waits, sleep, and class a timing
+
+
+
+
+
+
+# ======================================================================
+# 2. Roles & sensor model honest vs. adversarial  inclusive of mimicry)  - This adresses the point broguht up during initial review
+# =====================================================================
+PROC InitRolesAndSensors(N,Beta):
+  roles[i]∈{HONEST, BYZ} for i=1..N
+  mark ⌊Beta*N⌋ uniformly as BYZ (BYZ may lie or attck the radio) 
+
+  # Ground truth x*(t):continuous & can change (reefer door opens at t=t0) --- I really want this to be dynamic
+  x_star(t) = piecewise process, such as: 25 C --> 28 C at t=1200s
+
+  # Honest sensor:y_i(t)=x*(t)+Normal(0, NoiseSigma) 
+  Honest(i,t):return x_star(t) + Normal(0, NoiseSigma)
+
+
+  # Byzantine behaviorsto be displayed as addressed in the initial review (choose per round or per node):
+  #  MIMIC: overlap your CI with local honest CI (passes IoU) but add small bias.
+      - pass acceptance checks while continually nudging the final estimate the wrong direction
+      - craft a CI that overlaps honest neighbors just enough to
+      - pass the IoU test but set my midpoint "slightly" biased (+0.4 C every go around)
+  
+  #  COLLIDER: transmit at busy windows to hurt p_s for honest traffic (ns3).
+  #  - transmit during busy windows so honest packets collide and get dropped 
+  #    ns-3 'should letme schedule this during high offered load from what i have seen so far
+  
+  
+  # SPIKE/DRIFT/RANDOM: classical attacks 
+  Adversary(i,t): return OneOf(MIMIC,COLLIDE,SPIKE,DRIFT,RANDOM)
+  SPIKE: transmit during busy windows so honest packets collide and get dropped off
+  ns-3 will let me schedule this precisely during high offered load
+  DRIFT:Slowly slide my reports away from truth over time  NEEDS TO BE harder to detect than spikes
+  RANDOM: Send unstructured noise baseline “dumbed down” attacker to test basic robustness
+  
+
+  RETURN roles,x_star,Honest, Adversary
+# ns3 note:
+# - COLLIDER attack can be scripted by scheduling sends to coincide with high-channel util -- offered load spikes
+
+
+
+
+
+
+
+# =========================================================
+# 3.Consensus state + admin metadata per node init
+# =========================================================
+
+PROC InitConsensusState(N,y0,W0):
+  FOR i in 1..N:
+    CI_mid[i]=y0[i]          # current estimate CI midpoint at node i   -- best guessing 
+    CI_w[i]=W0             # current CI half width at node i --> uncertainty
+    quarantine[i] = 0          # joining/quarantine counter (set later when nodes join) - basically am I on probation or not 
+    last_rx_time[i]=now()    #time we last received any messages
+
+  PartitionID=0              # tracks component layout over time (for plots/metrics)
+  RETURN CI_mid,CI_w,quarantine,last_rx_time,PartitionID
+
+
+
+
+
+
+# =========================================================
+# 4.  One 'effective round'  maps to multiple packets/ seconds in ns3
+#     acceptance (IoU+ a vote) ,robust aggregation, adaptive - λ,partitions - could be seen as my raw sensor read
+# =========================================================
+PROC OneRound(nodes,CI_mid,CI_w,roles,TimeNow):
+  # ------ 4a Sense & package CI(application layer) -------------------------
+  FOR i in 1..N :
+    yi=(roles[i]==HONEST) ? Honest(i,TimeNow): Adversary(i,TimeNow)
+    my_CI[i] = [CI_mid[i]-CI_w[i], CI_mid[i]+CI_w[i]]
+    payload[i] = {
+      CI: my_CI[i],     # confidence interval to share - overlapping IOU see ABOVE (1)
+      mid: CI_mid[i],       # midpoint 'point estimate' for robust center calculations by peers
+      var_hint: CI_w[i]^2,  # optional variance hint scalar basic proxy
+      seq: IncrementSeq(i),  # per node monotone sequence --> detect replays/out o order
+      ts:TimeNow  # timestamp (light sync only relative freshness needed) } # - freshness check
+
+
+
+  #--- 4b Broadcast attempts subject to radio reality ns3 --------------
+  tx_handles=[]
+  FOR i in 1..N:
+    if NS3.CanTransmitNow(i): # respects DutyCycle + WakeFraction
+       tx_handles.append(NS3.Send(i, payload[i]))  # LoRa airtime =f(SF,BW,CR,payload)
+  NS3.RunUntilAllTxComplete(tx_handles)   # channel evolves:collisions capture loss
+
+
+
+
+  # --- 4c Gather inbox + liveness might be thinned out ----------------------------------------
+  FOR j in 1..N:
+    inbox[j] =NS3.ReceivedPayloads(j)#list of neighbor CI arrivals
+    if inbox[j] != ∅:
+       last_rx_time[j]=TimeNow
+
+
+
+
+
+  # --- 4d  Acceptance IoU threshold setting + consistency vote anti mimic behavior ------
+  FOR each honest node j:
+    my = my_CI[j]
+    A_vals=[]          # values to aggregate (midpoints)
+    votes=[]          # for consistency check (midpoint+weight)
+
+    FOR pkt in inbox[j]:
+      IoU = IntersectionOverUnion(my, pkt.CI)     # IoU = |∩| / |∪| of intervals see 1 
+      if IoU >= AcceptTau_IOU:
+         A_vals.append(pkt.mid)
+         votes.append((pkt.mid,pkt.var_hint))
+
+    A_vals.append(CI_mid[j])# inclunsive o self to stabilize
+
+    # Consistency vote:require dense mode of agreements around some center point
+    #  1D DBSCAN or sliding quantile window of width ~ CI_w[j]
+    mode_center, support = ModeWindow(votes, width=CI_w[j])
+    weak_support = (support < max(3, ceil(0.5 * |votes|)))  # too few consistent neighbors?
+
+
+
+
+
+
+  # --- 4e Auto trimmer via robust scale - mean absolute deviation  - I just want to give estimators a clean core to operate on-------------------------------
+    s = MAD(A_vals)  # 'median absolute deviation'
+    TrimT = Clip( floor( alpha(s,W0) *|A_vals| ), TrimT_min,TrimT_max )
+    A_sorted = sort(A_vals)
+    if 2*TrimT < |A_sorted|:
+       A_trim = A_sorted[TrimT :|A_sorted| - TrimT]
+    else:
+       A_trim = A_sorted
+       
+
+
+
+
+
+
+  # --- 4f Robust estimator selector -------------------------------------
+    switch Estimator:
+      case TrimmedMean:new_mid = mean(A_trim)  # fast and good IF there are few outliers present 
+      case GeomMedian:  new_mid=GeometricMedian(A_vals,iters=10) - I am thinking that this will be my default
+      case MoM: new_mid = MedianOfMeans(A_vals,groups=5) # breakdown ~ 1/2  
+      case Catoni: new_mid = CatoniMean(A_vals, scale=max(NoiseSigma,s))  # heavy tailed noise optimal
+
+
+
+
+  # --- 4g Adaptive contraction λ variance aware conservative under ambiguity
+        # Brains of the stabilziation speed and prevents overconfidence when data is thin or completely sketchy
+        # yet lets you fly when the crowd is tighter
+    disp=max(s,StdDev(A_trim))
+    lam =MapDispersionToLambda(disp, low=LambdaMin,high=LambdaMax)
+    if weak_support: lam = min(lam, 0.5*LambdaMin)# extra caution ---> slower shrinkage
+
+    new_w =max( (1-lam) * CI_w[j], Epsilon/4 ) # never shrink below ε/4
+    new_m=new_mid
+
+
+
+
+
+  # --- 4h Commit 'honest'  with join + quarantine throttling ---------------
+    if roles[j]==HONEST:
+    
+      if quarantine[j] > 0:
+         CI_mid[j] = Blend(CI_mid[j], new_m, eta=0.3) # slow blend while brand new
+         CI_w[j]   = max(CI_w[j], new_w) # avoid instant over confidence off the start
+         quarantine[j] -= 1
+      else:
+         CI_mid[j]=new_m
+         CI_w[j]=new_w
+    # BYZ nodes can ignore updates or follow their adversarial policy
+
+
+
+
+
+  # --- 4i Partition detection per component ε tracking) --------------------------
+  comps = ConnectedComponentsByRecentRX(inbox,last_rx_time,PartitionTimeout_s)
+  PartitionID=HashComponents(comps) # for plots + change tracking / the yard of nodes is not blobbed together to one
+
+
+
+
+
+  # --- 4j Instrumentation ns3 + algo metrics) -------------------------------
+  metrics=MeasureRound(nodes,inbox,roles,CI_w_prev=CI_w_old,CI_w_curr=CI_w,TimeNow)
+  metrics.PartitionID=PartitionID
+  RETURN CI_mid,CI_w,metrics
+# ns3 notes for future addititon:
+# p_s_round=(#PhyRxEndOk from honest senders) / (#PhyTxBegin by honest senders)
+# T_pkt_round=avg airtime from PHY traces (validates SF/BW/CR effect)
+#  duty cycle blocking visible in MAC traces wake misalignment ---> missed RX window
+#  pillar of the prediticiton bound later in the plots 
+
+
+
+
+
+
+# ============================================================
+# 5 Round metrics feeds the bound and plots - my scoreboard
+# ===========================================================
+
+PROC MeasureRound(nodes, inbox, roles, CI_w_prev, CI_w_curr, TimeNow):
+  #ns3 packet success probability -- honest node only
+  TX_hon=NS3.CountPhyTx(honest_senders=True) - how many honest containers actually tried to transmit atr the PHY
+  RX_hon =NS3.CountPhyRxOkFrom(honest_senders=True)
+  p_s=RX_hon /max(1,TX_hon) -honest packet sucess prob
+
+  #[Ns3] Average packet airtime
+  T_pkt=NS3.MeanAirtimeFromPHY()
+
+
+  # CONTINUOUS FEED Honest accepted messages per honest node
+  m_hon  = MeanOverHonest( CountAcceptedHonest(inbox[j]) )
+
+
+  # CONTINUOUS FFED Observed contraction factor -- CI width shrink 
+  lam_obs=MedianOverHonest( 1 - CI_w_curr[j] / max(1e-9, CI_w_prev[j]) )
+  for each of the honest nodes - how many were actually accepted POST filter (eg IoU threshold etc) 
+
+
+
+  # CONTINUOUS FEED Change detection for continuous re stabilization stats
+  change_flag = (ChangeDetect == OFF) ? False:DetectChange(ChangeDetect,history=CI_mid)
+    
+  return{ p_s,T_pkt,m_hon,lam_obs,change_flag}
+
+
+
+
+
+
+
+# ================================================================
+# 6  ε agreement check per partition + CONTINUOUS stability (stability winders per component)
+# ===========================================================
+PROC CheckEpsilon(CI_mid,roles, x_star, Epsilon, comps):
+  result={}
+  FOR comp in comps:
+    H = [i in comp|roles[i]==HONEST]    # my honest nodes
+    mids = [CI_mid[i] for i in H]    #current estimates
+    condA = (max(mids) - min(mids)<= Epsilon)   # pairwise agreement
+    condB = all(|CI_mid[i] - x_star(now())| <= Epsilon for i in H ) # truth agreement
+    result[comp] = (condA AND condB)
+  RETURN result
+
+
+
+
+
+
+# =========================================================
+# 7 Prediction boundary (theory uses ns3 measured inputs)
+# =========================================================
+
+FUNC PredictTimeSeconds(W0,Eps,p_s_eff,lam_eff,T_pkt_eff, DutyCycle):
+  # T_ε=[log(W0/Eps)/(p_s_eff * log(1/(1 - lam_eff)))] * (T_pkt_eff / DutyCycle)
+  if lam_eff <= 0 or lam_eff >= 1: return -infinite
+  rounds = log(max(W0/Eps, 1+1e-7))/(p_s_eff * log(1.0/(1.0 - lam_eff)))
+  return rounds * (T_pkt_eff / DutyCycle)
+
+
+# THEORY HOOK:
+#  - I have the ability to analyze tighter constants when acceptance= IoU+Vote and Estimator=GeomMedian/MoM + Catoni 
+#  - Prove lam_eff >= λ_min under bounded honest dispersion & honest majority in accepted set
+#  Show p_s_eff concentrates via ns3 packet process --> Chernoff/Hoeffding over windows 
+
+
+
+
+
+# =========================================================
+# 8  MAIN loop single seed  includes continuous restabilization timing
+# =========================================================
+
+
+PROC RunOneSeed(seed):    # setting this to be reproducible
+  SetRNG(seed)
+  nodes=SetupNetwork()                                 # ns3 - setting the yard
+  roles,x_star,Honest,Adversary=InitRolesAndSensors(N,Beta)         #honest vs BYZ
+  y0=[ Honest(i,0) if roles[i]==HONEST else Adversary(i,0) for i in 1..N ]        # first reading at t0
+  CI_mid, CI_w,quarantine,last_rx_time,PartitionID=InitConsensusState(N,y0,W0)   
+  round=0       #round counter
+  stable_state_per_comp={}                             # setting continuous bookkeeping
+  
+  
+  while round<MaxRounds:
+    round += 1
+    CI_mid,CI_w,metrics=OneRound(nodes, CI_mid, CI_w, roles, TimeNow=WallClock()) # running my part 4
+    # Estimated effective round wall-time  prefer ns3 wall clock if available
+    eff_round_s=NS3.LastRoundWallTime() or (metrics.T_pkt / DutyCycle)
+
+
+    # Continuous ε-check 
+    comps=metrics.PartitionID.Components
+    eps_ok=CheckEpsilon(CI_mid,roles,x_star,Epsilon,comps)
+
+    # This is a major part of my thesis - this is the heart of the 'continuous element'
+    # Convergence isnt measured at once, it is measuerd on the basis of how long it sayed within ε
+    # Enter and exit stability windows per component (for re stabilization stats)
+    FOR comp in comps:
+      if eps_ok[comp] and not stable_state_per_comp.get(comp, False):
+        stable_state_per_comp[comp] = True
+        record t_enter[comp] = SimTime()  
+      
+      elif (not eps_ok[comp]) and stable_state_per_comp.get(comp,False):
+        stable_state_per_comp[comp] = False
+        record stable_duration[comp] += SimTime() - t_enter[comp]
+
+
+
+    # Report early if all comps are stable and no change_flag
+    if AllTrue(eps_ok.values()) and not metrics.change_flag:
+      p_s_eff   = MovingAverage(metrics_history.p_s)      #input to bound
+      T_pkt_eff= MovingAverage(metrics_history.T_pkt)
+      lam_eff= MovingAverage(metrics_history.lam_obs)  # or use LambdaMin..Max map
+      T_pred=PredictTimeSeconds(W0, Epsilon, p_s_eff, lam_eff,T_pkt_eff, DutyCycle)
+      T_meas =AccumulateWallTime()                   # ns3 wall clock till now
+      GAP= T_meas / T_pred
+      return { converged:True, measured_time_s:T_meas, predicted_time_s:T_pred,
+               gap_ratio: GAP, rounds:round, per_comp:eps_ok }
+
+  return { converged: False, measured_time_s: None, predicted_time_s: None,
+           gap_ratio: infinit,rounds: MaxRounds }
+
+
+
+
+
+Scenario ShippyCo_Baseline:
+  N=100, Area=1000x1000m,Beta=0.10, Epsilon=1.0, W0=5.0, NoiseSigma=0.5
+  SF=9, BW=125,CR=4/5, TxPower=14 dBm, DutyCycle=0.01, ALOHA=PURE, WakeFraction=0.5
+  AcceptTau_IOU=0.20,TrimT_min=2, TrimT_max=0.2|A|,Estimator=GeomMedian
+  LambdaMin=0.08, LambdaMax=0.18, ChangeDetect=CUSUM
+  K_quarantine=3, PartitionTimeout_s=3*RoundBudget_s
+  RoundBudget_s ≈ (T_pkt from SF=9)/DutyCycle  # ns3 measures T_pkt live
+  Seeds=20, MaxRounds=5000
+  
+  
+
+
+
+
+
+
