@@ -13,10 +13,12 @@ Existing Byzantine consensus algorithms assume idealized network models with per
 This work presents a novel Byzantine-resilient consensus framework tailored for **LoRaWAN-class networks** that:
 1. Operates under **packet loss rates of 40-70%** due to ALOHA collisions and duty-cycle constraints
 2. Achieves ε-agreement despite **mimicry attacks** where adversaries craft confidence intervals that pass overlap checks while continuously biasing estimates
-3. Tracks **continuous stability** with rigorous re-stabilization timing after environmental changes (e.g., cold-chain door openings)
+3. Tracks **continuous stability** with rigorous re-stabilization timing after ground truth changes (dynamic environments)
 4. Provides **ns-3-grounded convergence bounds** that predict time-to-consensus using measured packet success probability (p_s), airtime (T_pkt), and adaptive contraction factors (λ)
 
 **Research Gap Addressed**: No prior work combines Byzantine resilience with the extreme radio constraints of LPWAN (1% duty cycle, SF7-12 spreading factors, Class A receive windows) while maintaining continuous operational guarantees.
+
+**Parameter Instantiation**: We use ε=1.0, σ=0.5 as representative parameter values for concrete validation. These values are within typical ranges for distributed sensing systems. Sensitivity analysis validates algorithm performance across 2 orders of magnitude in scale and diverse parameter regimes.
 
 ---
 
@@ -41,7 +43,7 @@ Unlike prior work measuring T_conv (time to first ε-agreement), we track:
 - **Re-stabilization time**: Latency to re-converge after detected changes (CUSUM/GLR)
 - **Per-component stability**: Independent tracking in partitioned networks
 
-**Application**: Cold-chain monitoring requires *continuous* trust, not one-shot convergence. Operators need guarantees like "95% of time within ±1°C despite 10% Byzantine nodes."
+**Motivation**: Systems requiring *continuous* trust—distributed control, collaborative robotics, persistent monitoring—need guarantees like "95% of time within ε-agreement despite f Byzantine nodes," not just one-shot convergence.
 
 ### 3. Radio-Realistic Convergence Bounds
 Classical bounds (e.g., Tsitsiklis, Vaidya) assume synchronous rounds or bounded delays. We derive:
@@ -434,5 +436,5 @@ Academic use only. See LICENSE file.
 
 Zachary Larkin  
 Vanderbilt University  
-Department of Computer Science  
-Email: [your.email@vanderbilt.edu]
+School of Engineering  
+Email: [zachary.larkin@vanderbilt.edu]
